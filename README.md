@@ -1,5 +1,7 @@
 # Sibling Marker - Anki Addon
 
+_Written entirely by Claude, skim-reviewed by Saul Munn._
+
 Mark any cards as siblings, even if they're from different notes. When you review one card, its custom siblings are automatically buried for the day.
 
 ## Installation
