@@ -52,13 +52,15 @@ def log_error(message: str, exc: Optional[Exception] = None) -> None:
 # =============================================================================
 
 def sanitize_group_name(name: str) -> str:
-    """Sanitize a group name for use in tags."""
-    # Replace spaces and special chars with underscores
-    sanitized = re.sub(r'[^\w\-]', '_', name)
+    """Sanitize a group name for use in tags. Preserves :: for hierarchy."""
+    # Replace spaces and special chars with underscores, but keep : for hierarchy
+    sanitized = re.sub(r'[^\w\-:]', '_', name)
+    # Normalize multiple colons to exactly two (for hierarchy)
+    sanitized = re.sub(r':+', '::', sanitized)
     # Remove consecutive underscores
     sanitized = re.sub(r'_+', '_', sanitized)
-    # Remove leading/trailing underscores
-    sanitized = sanitized.strip('_')
+    # Remove leading/trailing underscores and colons
+    sanitized = sanitized.strip('_:')
     return sanitized.lower() if sanitized else None
 
 def get_sibling_tag(group_name: str) -> str:
