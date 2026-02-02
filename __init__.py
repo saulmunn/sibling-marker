@@ -94,7 +94,7 @@ def get_all_sibling_groups() -> dict:
     
     groups = {}
     # Find all notes with sibling tags
-    note_ids = mw.col.find_notes(f'"tag:{TAG_PREFIX}*"')
+    note_ids = mw.col.find_notes(f"tag:{TAG_PREFIX}*")
     
     for nid in note_ids:
         try:
@@ -116,7 +116,7 @@ def get_cards_for_sibling_group(group_name: str) -> List[int]:
         return []
     
     tag = get_sibling_tag(group_name)
-    note_ids = mw.col.find_notes(f'"tag:{tag}"')
+    note_ids = mw.col.find_notes(f"tag:{tag}")
     
     card_ids = []
     for nid in note_ids:
@@ -387,7 +387,7 @@ def bury_custom_siblings(card: Card) -> int:
                 continue
             
             # Find all notes with this tag
-            note_ids = col.find_notes(f'"tag:{tag}"')
+            note_ids = col.find_notes(f"tag:{tag}")
             
             for nid in note_ids:
                 if nid == card.nid:
