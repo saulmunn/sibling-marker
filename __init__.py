@@ -26,6 +26,7 @@ from datetime import datetime
 
 ADDON_NAME = "Sibling Marker"
 TAG_PREFIX = "sibling::"
+SUSPENDED_TAG_PREFIX = "sibling-suspended::"
 DEBUG_MODE = False
 
 # =============================================================================
@@ -81,6 +82,21 @@ def generate_group_id() -> str:
     """Generate a unique group ID."""
     import uuid
     return str(uuid.uuid4())[:8]
+
+# =============================================================================
+# SYNC CHECK TIMESTAMP
+# =============================================================================
+
+def get_last_sync_check_time() -> int:
+    """Get timestamp of last revlog check (milliseconds)."""
+    if mw.col is None:
+        return 0
+    return mw.col.get_config("sibling_marker_last_check", 0)
+
+def set_last_sync_check_time(timestamp: int) -> None:
+    """Store timestamp of last revlog check."""
+    if mw.col is not None:
+        mw.col.set_config("sibling_marker_last_check", timestamp)
 
 # =============================================================================
 # CORE FUNCTIONS
@@ -240,6 +256,10 @@ def mark_cards_as_siblings(card_ids: List[int], group_name: Optional[str] = None
     if modified_count > 0:
         tooltip(f"Marked {len(note_ids)} notes as siblings (group: {final_group_name})")
         log(f"Added sibling tag '{tag}' to {modified_count} notes")
+        
+        # Apply cross-platform sibling separation
+        apply_sibling_separation(final_group_name, card_ids)
+        
         return True
     else:
         tooltip("Notes were already in this sibling group")
@@ -433,6 +453,287 @@ def bury_custom_siblings(card: Card) -> int:
         log_error("Error in bury_custom_siblings", e)
         return 0
 
+def process_reviews_since_last_check() -> int:
+    """Check revlog for reviews since last check and bury siblings.
+    
+    This handles reviews that happened on mobile or other devices.
+    """
+    if mw.col is None:
+        return 0
+
+    last_check = get_last_sync_check_time()
+
+    # Query revlog for reviews since last check
+    # revlog.id is the timestamp in milliseconds
+    reviews = mw.col.db.list(
+        "SELECT DISTINCT cid FROM revlog WHERE id > ?", last_check
+    )
+
+    if not reviews:
+        # Update timestamp even if no reviews, so we don't re-check old ones
+        import time
+        set_last_sync_check_time(int(time.time() * 1000))
+        return 0
+
+    total_buried = 0
+    for cid in reviews:
+        try:
+            card = mw.col.get_card(cid)
+            buried = bury_custom_siblings(card)
+            total_buried += buried
+        except Exception:
+            pass  # Card may have been deleted
+
+    # Update last check time to now (in milliseconds)
+    import time
+    set_last_sync_check_time(int(time.time() * 1000))
+
+    return total_buried
+
+# =============================================================================
+# CROSS-PLATFORM SIBLING SEPARATION
+# =============================================================================
+
+def suspend_new_card_siblings(group_name: str, card_ids: List[int]) -> int:
+    """
+    Suspend all but the first new card in a sibling group.
+    This enables cross-platform sibling separation since suspension syncs.
+    """
+    if mw.col is None:
+        return 0
+
+    # Get all cards and filter to new cards only
+    new_cards = []
+    for cid in card_ids:
+        try:
+            card = mw.col.get_card(cid)
+            if card.queue == 0 and card.type == 0:  # New card
+                new_cards.append(card)
+        except Exception:
+            pass
+
+    if len(new_cards) < 2:
+        return 0
+
+    # Sort by card ID for stable ordering
+    new_cards.sort(key=lambda c: c.id)
+
+    # Keep the first one active, suspend the rest
+    suspended_count = 0
+    for card in new_cards[1:]:
+        try:
+            # Suspend the card
+            card.queue = -1
+            mw.col.update_card(card)
+            
+            # Add the sibling-suspended tag to track it
+            note = card.note()
+            suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+            if suspended_tag not in note.tags:
+                note.tags.append(suspended_tag)
+                mw.col.update_note(note)
+            
+            suspended_count += 1
+            log(f"Suspended new card {card.id} in group {group_name}")
+        except Exception as e:
+            log_error(f"Error suspending card {card.id}", e)
+
+    return suspended_count
+
+
+def check_and_unsuspend_siblings() -> int:
+    """
+    Unsuspend the NEXT sibling in each group if the previous one was reviewed.
+    Called on profile load to release siblings sequentially.
+    """
+    if mw.col is None:
+        return 0
+
+    groups = get_all_sibling_groups()
+    total_unsuspended = 0
+
+    for group_name, note_ids in groups.items():
+        # Get all cards in this group with their notes
+        all_cards_with_notes = []
+        for nid in note_ids:
+            try:
+                note = mw.col.get_note(nid)
+                for card in note.cards():
+                    all_cards_with_notes.append((card, note))
+            except Exception:
+                pass
+
+        if not all_cards_with_notes:
+            continue
+
+        # Sort by card ID for stable ordering
+        all_cards_with_notes.sort(key=lambda x: x[0].id)
+
+        # Track: have all previous siblings been reviewed?
+        previous_all_reviewed = True
+        unsuspended_one = False
+
+        for card, note in all_cards_with_notes:
+            # Check if this card is a sibling-suspended card
+            is_suspended_sibling = (
+                card.queue == -1 and
+                any(t.startswith(SUSPENDED_TAG_PREFIX) for t in note.tags)
+            )
+
+            if is_suspended_sibling:
+                if previous_all_reviewed and not unsuspended_one:
+                    # Unsuspend this one card
+                    card.queue = 0  # Back to new
+                    mw.col.update_card(card)
+                    
+                    # Remove the sibling-suspended tag from this note
+                    note.tags = [t for t in note.tags if not t.startswith(SUSPENDED_TAG_PREFIX)]
+                    mw.col.update_note(note)
+                    
+                    total_unsuspended += 1
+                    unsuspended_one = True
+                    log(f"Unsuspended sibling card {card.id} in group {group_name}")
+                # Don't break - continue to check if there are more suspended siblings
+            else:
+                # This is an active (non-suspended) sibling
+                # Check if it has been reviewed
+                has_reviews = mw.col.db.scalar(
+                    "SELECT COUNT() FROM revlog WHERE cid = ?", card.id
+                )
+                if has_reviews == 0 and card.type == 0:
+                    # This card hasn't been reviewed yet - don't unsuspend the next one
+                    previous_all_reviewed = False
+
+    return total_unsuspended
+
+
+def spread_review_card_due_dates(group_name: str, min_gap_days: int = 1) -> int:
+    """
+    Spread review cards in a sibling group across consecutive days.
+    This ensures review siblings are never due on the same day.
+    """
+    if mw.col is None:
+        return 0
+
+    tag = get_sibling_tag(group_name)
+    note_ids = mw.col.find_notes(f"tag:{tag}")
+    today = mw.col.sched.today
+
+    # Collect all review cards due today or earlier
+    review_cards_due = []
+    for nid in note_ids:
+        try:
+            note = mw.col.get_note(nid)
+            for card in note.cards():
+                # Review cards due today or overdue
+                if card.queue == 2 and card.due <= today:
+                    review_cards_due.append(card)
+        except Exception:
+            pass
+
+    if len(review_cards_due) < 2:
+        return 0
+
+    # Sort by due date, then by card ID for stability
+    review_cards_due.sort(key=lambda c: (c.due, c.id))
+
+    # Keep the first one as-is, spread the rest
+    rescheduled = 0
+    for i, card in enumerate(review_cards_due[1:], start=1):
+        new_due = today + (i * min_gap_days)
+        if card.due != new_due:
+            card.due = new_due
+            mw.col.update_card(card)
+            rescheduled += 1
+            log(f"Rescheduled review card {card.id} to day {new_due}")
+
+    return rescheduled
+
+
+def reschedule_review_siblings(card: Card, days_offset: int = 1) -> int:
+    """
+    Reschedule review siblings to tomorrow after a card is reviewed.
+    This ensures the rescheduled due dates sync to mobile.
+    """
+    if not card or mw.col is None:
+        return 0
+
+    try:
+        note = card.note()
+        sibling_tags = get_sibling_tags_for_note(note)
+        
+        if not sibling_tags:
+            return 0
+
+        today = mw.col.sched.today
+        target_due = today + days_offset
+        rescheduled = 0
+
+        for tag in sibling_tags:
+            group_name = extract_group_name(tag)
+            if not group_name:
+                continue
+
+            note_ids = mw.col.find_notes(f"tag:{tag}")
+            
+            for nid in note_ids:
+                if nid == card.nid:
+                    continue  # Skip the answered card's note
+
+                try:
+                    sibling_note = mw.col.get_note(nid)
+                    for sib_card in sibling_note.cards():
+                        # Only reschedule review cards due today or earlier
+                        if sib_card.queue == 2 and sib_card.due <= today:
+                            sib_card.due = target_due
+                            mw.col.update_card(sib_card)
+                            rescheduled += 1
+                except Exception:
+                    pass
+
+        return rescheduled
+
+    except Exception as e:
+        log_error("Error in reschedule_review_siblings", e)
+        return 0
+
+
+def enforce_sibling_separation() -> int:
+    """
+    Scan all sibling groups and ensure proper separation.
+    - For new cards: handled by suspend/unsuspend mechanism
+    - For review cards: spread due dates
+    """
+    if mw.col is None:
+        return 0
+
+    groups = get_all_sibling_groups()
+    total_rescheduled = 0
+
+    for group_name in groups.keys():
+        rescheduled = spread_review_card_due_dates(group_name)
+        total_rescheduled += rescheduled
+
+    return total_rescheduled
+
+
+def apply_sibling_separation(group_name: str, card_ids: List[int]) -> None:
+    """
+    Apply sibling separation for a newly marked group.
+    - Suspends new card siblings (all but first)
+    - Spreads review card due dates
+    """
+    # Handle new cards: suspend all but the first
+    suspended = suspend_new_card_siblings(group_name, card_ids)
+    if suspended > 0:
+        log(f"Suspended {suspended} new card siblings in group {group_name}")
+
+    # Handle review cards: spread due dates
+    spread = spread_review_card_due_dates(group_name)
+    if spread > 0:
+        log(f"Spread {spread} review card due dates in group {group_name}")
+
+
 # =============================================================================
 # MIGRATION FROM V1 (JSON storage)
 # =============================================================================
@@ -526,8 +827,23 @@ def on_reviewer_did_answer_card(reviewer, card, ease) -> None:
         buried = bury_custom_siblings(card)
         if buried > 0:
             tooltip(f"Buried {buried} custom sibling(s)")
+        
+        # Also reschedule review siblings for cross-platform sync
+        rescheduled = reschedule_review_siblings(card)
+        if rescheduled > 0:
+            log(f"Rescheduled {rescheduled} review sibling(s) for sync")
     except Exception as e:
         log_error("Error in reviewer hook", e)
+
+def on_sync_did_finish() -> None:
+    """Called after sync completes - check for mobile reviews."""
+    try:
+        buried = process_reviews_since_last_check()
+        if buried > 0:
+            tooltip(f"Buried {buried} sibling(s) from synced reviews")
+            log(f"Post-sync: buried {buried} siblings")
+    except Exception as e:
+        log_error("Error in sync hook", e)
 
 def on_browser_context_menu(browser: Browser, menu: QMenu) -> None:
     """Add sibling marker options to browser context menu."""
@@ -610,8 +926,25 @@ def setup_menu() -> None:
         log_error("Failed to setup menu", e)
 
 def on_profile_loaded() -> None:
-    """Called when a profile is loaded - run migration if needed."""
+    """Called when a profile is loaded - run migration and check siblings."""
     migrate_from_json()
+    
+    # Initialize last check time if not set (so we don't process old reviews)
+    if get_last_sync_check_time() == 0:
+        import time
+        set_last_sync_check_time(int(time.time() * 1000))
+    
+    # Check if any suspended siblings should be unsuspended
+    unsuspended = check_and_unsuspend_siblings()
+    if unsuspended > 0:
+        tooltip(f"Unsuspended {unsuspended} sibling(s) ready for review")
+        log(f"Profile load: unsuspended {unsuspended} siblings")
+    
+    # Enforce separation for review cards (spread due dates if needed)
+    rescheduled = enforce_sibling_separation()
+    if rescheduled > 0:
+        tooltip(f"Rescheduled {rescheduled} sibling(s) to maintain separation")
+        log(f"Profile load: rescheduled {rescheduled} review card siblings")
 
 # =============================================================================
 # REGISTER HOOKS
@@ -621,5 +954,6 @@ gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
 gui_hooks.reviewer_did_answer_card.append(on_reviewer_did_answer_card)
 gui_hooks.main_window_did_init.append(setup_menu)
 gui_hooks.profile_did_open.append(on_profile_loaded)
+gui_hooks.sync_did_finish.append(on_sync_did_finish)
 
 log("Sibling Marker addon loaded (v2.0 - tag-based sync)")
