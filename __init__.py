@@ -33,11 +33,18 @@ DEBUG_MODE = False
 # LOGGING
 # =============================================================================
 
+LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sibling_marker.log")
+
 def log(message: str, level: str = "INFO") -> None:
-    """Log a message to console."""
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    """Log a message to console and file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full_msg = f"[{ADDON_NAME}] [{level}] {timestamp}: {message}"
     print(full_msg)
+    try:
+        with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+            f.write(full_msg + "\n")
+    except Exception:
+        pass
     if DEBUG_MODE and level == "ERROR":
         tooltip(f"Sibling Marker Error: {message}")
 
@@ -109,11 +116,30 @@ def get_all_sibling_groups() -> dict:
     """
     if mw.col is None:
         return {}
-    
+
     groups = {}
     # Find all notes with sibling tags
-    note_ids = mw.col.find_notes(f"tag:{TAG_PREFIX}*")
-    
+    # Try multiple search approaches for compatibility
+    search_queries = [
+        f'"tag:{TAG_PREFIX}*"',  # Quoted with ::
+        f"tag:sibling*",  # Simple prefix without ::
+    ]
+
+    note_ids = []
+    for search_query in search_queries:
+        try:
+            found = mw.col.find_notes(search_query)
+            log(f"get_all_sibling_groups: search '{search_query}' found {len(found)} notes")
+            if found:
+                note_ids = found
+                break
+        except Exception as e:
+            log(f"get_all_sibling_groups: search '{search_query}' failed: {e}")
+
+    if not note_ids:
+        log("get_all_sibling_groups: no notes found with sibling tags")
+        return {}
+
     for nid in note_ids:
         try:
             note = mw.col.get_note(nid)
@@ -125,7 +151,8 @@ def get_all_sibling_groups() -> dict:
                     groups[group_name].append(nid)
         except Exception as e:
             log_error(f"Error reading note {nid}", e)
-    
+
+    log(f"get_all_sibling_groups: returning {len(groups)} groups")
     return groups
 
 def get_cards_for_sibling_group(group_name: str) -> List[int]:
@@ -270,7 +297,7 @@ def remove_from_sibling_group(card_ids: List[int]) -> bool:
     if mw.col is None:
         showInfo("Please open a collection first.")
         return False
-    
+
     # Get unique notes
     note_ids: Set[int] = set()
     for cid in card_ids:
@@ -279,25 +306,42 @@ def remove_from_sibling_group(card_ids: List[int]) -> bool:
             note_ids.add(card.nid)
         except Exception:
             pass
-    
+
     removed_count = 0
+    unsuspended_count = 0
     for nid in note_ids:
         try:
             note = mw.col.get_note(nid)
-            sibling_tags = get_sibling_tags_for_note(note)
-            if sibling_tags:
-                for tag in sibling_tags:
+            # Get both sibling:: and sibling-suspended:: tags
+            sibling_tags = [t for t in note.tags if t.startswith(TAG_PREFIX)]
+            suspended_tags = [t for t in note.tags if t.startswith(SUSPENDED_TAG_PREFIX)]
+
+            if sibling_tags or suspended_tags:
+                # Remove all sibling-related tags
+                for tag in sibling_tags + suspended_tags:
                     note.tags.remove(tag)
+
+                # If card was suspended by us, unsuspend it
+                if suspended_tags:
+                    for card in note.cards():
+                        if card.queue == -1:  # Suspended
+                            card.queue = 0  # Back to new
+                            mw.col.update_card(card)
+                            unsuspended_count += 1
+
                 mw.col.update_note(note)
                 removed_count += 1
         except Exception as e:
             log_error(f"Error removing tags from note {nid}", e)
-    
+
     if removed_count > 0:
-        tooltip(f"Removed {removed_count} note(s) from sibling groups")
+        msg = f"Removed {removed_count} note(s) from sibling groups"
+        if unsuspended_count > 0:
+            msg += f", unsuspended {unsuspended_count} card(s)"
+        tooltip(msg)
     else:
         tooltip("Selected cards were not in any sibling groups")
-    
+
     return True
 
 def show_sibling_info(card_ids: List[int]) -> None:
@@ -387,79 +431,108 @@ def add_to_existing_group(card_ids: List[int], browser: Browser) -> bool:
 # BURY LOGIC
 # =============================================================================
 
-def bury_custom_siblings(card: Card) -> int:
-    """Bury custom siblings when a card is answered."""
+def bury_custom_siblings(card: Card) -> dict:
+    """
+    Handle custom siblings when a card is answered.
+
+    For mobile sync compatibility:
+    - NEW card siblings → SUSPEND (suspension syncs, burying doesn't)
+    - Learning/Review siblings → BURY (for same-day desktop separation)
+
+    Returns dict with counts by card type.
+    """
     if not card or mw.col is None:
-        return 0
-    
+        return {"suspended_new": 0, "buried_learning": 0, "buried_review": 0}
+
     try:
         note = card.note()
         sibling_tags = get_sibling_tags_for_note(note)
-        
+
         if not sibling_tags:
-            return 0
-        
+            return {"suspended_new": 0, "buried_learning": 0, "buried_review": 0}
+
         col = mw.col
-        cards_to_bury: Set[int] = set()
-        
+        learning_to_bury: Set[int] = set()
+        review_to_bury: Set[int] = set()
+        cards_to_suspend: list = []  # List of (card, note, group_name) tuples
+
         # Get all sibling cards from all groups this card belongs to
         for tag in sibling_tags:
             group_name = extract_group_name(tag)
             if not group_name:
                 continue
-            
+
             # Find all notes with this tag
             note_ids = col.find_notes(f"tag:{tag}")
-            
+
             for nid in note_ids:
                 if nid == card.nid:
                     continue  # Skip the current card's note
-                
+
                 try:
                     sibling_note = col.get_note(nid)
                     for sib_cid in sibling_note.card_ids():
                         if sib_cid == card.id:
                             continue
-                        
+
                         sib_card = col.get_card(sib_cid)
-                        
-                        # Only bury if card is active (not already buried/suspended)
+
+                        # Only process if card is active (not already buried/suspended)
                         if sib_card.queue >= 0:
-                            should_bury = False
-                            
-                            if sib_card.queue == 0:  # New
-                                should_bury = True
-                            elif sib_card.queue == 1:  # Learning
-                                should_bury = True
-                            elif sib_card.queue == 2:  # Review - due today
-                                should_bury = sib_card.due <= col.sched.today
-                            elif sib_card.queue == 3:  # Day learning
-                                should_bury = sib_card.due <= col.sched.today
-                            
-                            if should_bury:
-                                cards_to_bury.add(sib_cid)
+                            if sib_card.queue == 0:  # New → SUSPEND for mobile sync
+                                cards_to_suspend.append((sib_card, sibling_note, group_name))
+                            elif sib_card.queue == 1:  # Intraday learning → bury
+                                learning_to_bury.add(sib_cid)
+                            elif sib_card.queue == 3 and sib_card.due <= col.sched.today:  # Day learning → bury
+                                learning_to_bury.add(sib_cid)
+                            elif sib_card.queue == 2 and sib_card.due <= col.sched.today:  # Review due today → bury
+                                review_to_bury.add(sib_cid)
                 except Exception as e:
                     log(f"Error checking sibling card: {e}", "WARN")
-        
-        # Bury all at once
-        if cards_to_bury:
-            col.sched.bury_cards(list(cards_to_bury))
-            log(f"Buried {len(cards_to_bury)} custom sibling(s)")
-            return len(cards_to_bury)
-        
-        return 0
-        
+
+        # Suspend new card siblings (for mobile sync)
+        suspended_count = 0
+        for sib_card, sib_note, group_name in cards_to_suspend:
+            try:
+                sib_card.queue = -1
+                col.update_card(sib_card)
+
+                # Add tracking tag
+                suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+                if suspended_tag not in sib_note.tags:
+                    sib_note.tags.append(suspended_tag)
+                    col.update_note(sib_note)
+
+                suspended_count += 1
+            except Exception as e:
+                log(f"Error suspending sibling card {sib_card.id}: {e}", "WARN")
+
+        # Bury learning/review siblings
+        all_to_bury = list(learning_to_bury | review_to_bury)
+        if all_to_bury:
+            col.sched.bury_cards(all_to_bury)
+
+        if suspended_count > 0 or learning_to_bury or review_to_bury:
+            log(f"Handled siblings: {suspended_count} new suspended, {len(learning_to_bury)} learning buried, {len(review_to_bury)} review buried")
+
+        return {
+            "suspended_new": suspended_count,
+            "buried_learning": len(learning_to_bury),
+            "buried_review": len(review_to_bury)
+        }
+
     except Exception as e:
         log_error("Error in bury_custom_siblings", e)
-        return 0
+        return {"suspended_new": 0, "buried_learning": 0, "buried_review": 0}
 
-def process_reviews_since_last_check() -> int:
-    """Check revlog for reviews since last check and bury siblings.
-    
+def process_reviews_since_last_check() -> dict:
+    """Check revlog for reviews since last check and handle siblings.
+
     This handles reviews that happened on mobile or other devices.
+    Returns dict with counts of actions taken.
     """
     if mw.col is None:
-        return 0
+        return {"suspended_new": 0, "buried_learning": 0, "buried_review": 0}
 
     last_check = get_last_sync_check_time()
 
@@ -473,14 +546,18 @@ def process_reviews_since_last_check() -> int:
         # Update timestamp even if no reviews, so we don't re-check old ones
         import time
         set_last_sync_check_time(int(time.time() * 1000))
-        return 0
+        return {"suspended_new": 0, "buried_learning": 0, "buried_review": 0}
 
-    total_buried = 0
+    total_suspended_new = 0
+    total_buried_learning = 0
+    total_buried_review = 0
     for cid in reviews:
         try:
             card = mw.col.get_card(cid)
-            buried = bury_custom_siblings(card)
-            total_buried += buried
+            result = bury_custom_siblings(card)
+            total_suspended_new += result.get("suspended_new", 0)
+            total_buried_learning += result.get("buried_learning", 0)
+            total_buried_review += result.get("buried_review", 0)
         except Exception:
             pass  # Card may have been deleted
 
@@ -488,7 +565,11 @@ def process_reviews_since_last_check() -> int:
     import time
     set_last_sync_check_time(int(time.time() * 1000))
 
-    return total_buried
+    return {
+        "suspended_new": total_suspended_new,
+        "buried_learning": total_buried_learning,
+        "buried_review": total_buried_review
+    }
 
 # =============================================================================
 # CROSS-PLATFORM SIBLING SEPARATION
@@ -698,23 +779,182 @@ def reschedule_review_siblings(card: Card, days_offset: int = 1) -> int:
         return 0
 
 
+def apply_priority_based_separation() -> dict:
+    """
+    Apply priority-based sibling separation at sync time.
+
+    Priority: Learning > Review > New
+
+    Rules:
+    - If any LEARNING cards in group → suspend new siblings, bury review siblings
+    - Else if any REVIEW cards due in group → suspend new siblings
+
+    Returns dict with counts of actions taken.
+    """
+    if mw.col is None:
+        log("apply_priority_based_separation: no collection open")
+        return {"suspended": 0, "buried": 0, "unsuspended": 0}
+
+    groups = get_all_sibling_groups()
+    today = mw.col.sched.today
+
+    log(f"apply_priority_based_separation: found {len(groups)} sibling group(s), today={today}")
+
+    total_suspended = 0
+    total_buried = 0
+    total_unsuspended = 0
+
+    for group_name, note_ids in groups.items():
+        # Categorize all cards in this group
+        learning_cards = []  # Cards in learning (queue 1 or queue 3 due today)
+        review_cards_due = []  # Review cards due today (queue 2, due <= today)
+        new_cards = []  # New cards (queue 0)
+        suspended_new_cards = []  # Suspended new cards (queue -1 with our tag)
+
+        for nid in note_ids:
+            try:
+                note = mw.col.get_note(nid)
+                has_suspended_tag = any(t.startswith(SUSPENDED_TAG_PREFIX) for t in note.tags)
+
+                for card in note.cards():
+                    if card.queue == 0:  # New
+                        new_cards.append((card, note))
+                    elif card.queue == 1:  # Intraday learning
+                        learning_cards.append((card, note))
+                    elif card.queue == 3 and card.due <= today:  # Day learning due today
+                        learning_cards.append((card, note))
+                    elif card.queue == 2 and card.due <= today:  # Review due today
+                        review_cards_due.append((card, note))
+                    elif card.queue == -1 and has_suspended_tag:  # Our suspended new cards
+                        suspended_new_cards.append((card, note))
+            except Exception as e:
+                log_error(f"Error categorizing cards for note {nid}", e)
+
+        # Apply priority rules
+        has_learning = len(learning_cards) > 0
+        has_review_due = len(review_cards_due) > 0
+        has_new = len(new_cards) > 0
+
+        # Debug logging
+        log(f"Group {group_name}: {len(learning_cards)} learning, {len(review_cards_due)} review due, {len(new_cards)} new, {len(suspended_new_cards)} suspended-new")
+
+        if has_learning:
+            # Learning cards exist: suspend new siblings, bury review siblings
+
+            # Suspend new cards
+            for card, note in new_cards:
+                try:
+                    card.queue = -1
+                    mw.col.update_card(card)
+
+                    suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+                    if suspended_tag not in note.tags:
+                        note.tags.append(suspended_tag)
+                        mw.col.update_note(note)
+
+                    total_suspended += 1
+                    log(f"Suspended new card {card.id} (learning sibling exists)")
+                except Exception as e:
+                    log_error(f"Error suspending card {card.id}", e)
+
+            # Bury review cards due today
+            review_card_ids = [card.id for card, note in review_cards_due]
+            if review_card_ids:
+                try:
+                    mw.col.sched.bury_cards(review_card_ids)
+                    total_buried += len(review_card_ids)
+                    log(f"Buried {len(review_card_ids)} review card(s) (learning sibling exists)")
+                except Exception as e:
+                    log_error(f"Error burying review cards", e)
+
+        elif has_review_due:
+            # Review cards due but no learning: suspend new siblings only
+
+            for card, note in new_cards:
+                try:
+                    card.queue = -1
+                    mw.col.update_card(card)
+
+                    suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+                    if suspended_tag not in note.tags:
+                        note.tags.append(suspended_tag)
+                        mw.col.update_note(note)
+
+                    total_suspended += 1
+                    log(f"Suspended new card {card.id} (review sibling due)")
+                except Exception as e:
+                    log_error(f"Error suspending card {card.id}", e)
+
+        else:
+            # No learning or review due
+            # Ensure only ONE new card is active at a time
+
+            if len(new_cards) > 1:
+                # Multiple active new cards - suspend all but the first one
+                new_cards_sorted = sorted(new_cards, key=lambda x: x[0].id)
+                for card, note in new_cards_sorted[1:]:
+                    try:
+                        card.queue = -1
+                        mw.col.update_card(card)
+
+                        suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+                        if suspended_tag not in note.tags:
+                            note.tags.append(suspended_tag)
+                            mw.col.update_note(note)
+
+                        total_suspended += 1
+                        log(f"Suspended new card {card.id} (only one new sibling at a time)")
+                    except Exception as e:
+                        log_error(f"Error suspending card {card.id}", e)
+
+            elif len(new_cards) == 0 and len(suspended_new_cards) > 0:
+                # No active new cards, but we have suspended ones - unsuspend exactly ONE
+                suspended_sorted = sorted(suspended_new_cards, key=lambda x: x[0].id)
+                card, note = suspended_sorted[0]
+                try:
+                    card.queue = 0  # Back to new
+                    mw.col.update_card(card)
+
+                    # Remove the sibling-suspended tag
+                    note.tags = [t for t in note.tags if not t.startswith(SUSPENDED_TAG_PREFIX)]
+                    mw.col.update_note(note)
+
+                    total_unsuspended += 1
+                    log(f"Unsuspended new card {card.id} (next in sequence)")
+                except Exception as e:
+                    log_error(f"Error unsuspending card {card.id}", e)
+
+            # If len(new_cards) == 1 and suspended_new_cards exist, do nothing
+            # The one active new card is correct, others wait their turn
+
+    return {
+        "suspended": total_suspended,
+        "buried": total_buried,
+        "unsuspended": total_unsuspended
+    }
+
+
 def enforce_sibling_separation() -> int:
     """
     Scan all sibling groups and ensure proper separation.
-    - For new cards: handled by suspend/unsuspend mechanism
-    - For review cards: spread due dates
+
+    Uses priority-based separation:
+    - Learning > Review > New
+    - Learning cards cause new and review siblings to be hidden
+    - Review cards cause new siblings to be hidden
+
+    Returns total number of cards affected.
     """
     if mw.col is None:
         return 0
 
-    groups = get_all_sibling_groups()
-    total_rescheduled = 0
+    result = apply_priority_based_separation()
+    total = result["suspended"] + result["buried"] + result["unsuspended"]
 
-    for group_name in groups.keys():
-        rescheduled = spread_review_card_due_dates(group_name)
-        total_rescheduled += rescheduled
+    if total > 0:
+        log(f"Priority separation: {result['suspended']} suspended, {result['buried']} buried, {result['unsuspended']} unsuspended")
 
-    return total_rescheduled
+    return total
 
 
 def apply_sibling_separation(group_name: str, card_ids: List[int]) -> None:
@@ -824,10 +1064,21 @@ def migrate_from_json() -> bool:
 def on_reviewer_did_answer_card(reviewer, card, ease) -> None:
     """Hook called when a card is answered."""
     try:
-        buried = bury_custom_siblings(card)
-        if buried > 0:
-            tooltip(f"Buried {buried} custom sibling(s)")
-        
+        result = bury_custom_siblings(card)
+        suspended_new = result.get("suspended_new", 0)
+        buried_learning = result.get("buried_learning", 0)
+        buried_review = result.get("buried_review", 0)
+
+        if suspended_new > 0 or buried_learning > 0 or buried_review > 0:
+            parts = []
+            if suspended_new > 0:
+                parts.append(f"{suspended_new} new suspended")
+            if buried_learning > 0:
+                parts.append(f"{buried_learning} learning buried")
+            if buried_review > 0:
+                parts.append(f"{buried_review} review buried")
+            tooltip(f"Sibling Marker: {', '.join(parts)}")
+
         # Also reschedule review siblings for cross-platform sync
         rescheduled = reschedule_review_siblings(card)
         if rescheduled > 0:
@@ -835,13 +1086,33 @@ def on_reviewer_did_answer_card(reviewer, card, ease) -> None:
     except Exception as e:
         log_error("Error in reviewer hook", e)
 
+def on_sync_will_start() -> None:
+    """Called before sync starts - enforce sibling separation."""
+    log("Sync starting - running priority separation")
+    try:
+        total_affected = enforce_sibling_separation()
+        log(f"Pre-sync: priority separation affected {total_affected} card(s)")
+    except Exception as e:
+        log_error("Error in sync_will_start hook", e)
+
 def on_sync_did_finish() -> None:
     """Called after sync completes - check for mobile reviews."""
     try:
-        buried = process_reviews_since_last_check()
-        if buried > 0:
-            tooltip(f"Buried {buried} sibling(s) from synced reviews")
-            log(f"Post-sync: buried {buried} siblings")
+        result = process_reviews_since_last_check()
+        suspended_new = result.get("suspended_new", 0)
+        buried_learning = result.get("buried_learning", 0)
+        buried_review = result.get("buried_review", 0)
+
+        if suspended_new > 0 or buried_learning > 0 or buried_review > 0:
+            parts = []
+            if suspended_new > 0:
+                parts.append(f"{suspended_new} new suspended")
+            if buried_learning > 0:
+                parts.append(f"{buried_learning} learning buried")
+            if buried_review > 0:
+                parts.append(f"{buried_review} review buried")
+            tooltip(f"Sibling Marker (synced): {', '.join(parts)}")
+            log(f"Post-sync: {suspended_new} new suspended, {buried_learning} learning buried, {buried_review} review buried")
     except Exception as e:
         log_error("Error in sync hook", e)
 
@@ -926,25 +1197,16 @@ def setup_menu() -> None:
         log_error("Failed to setup menu", e)
 
 def on_profile_loaded() -> None:
-    """Called when a profile is loaded - run migration and check siblings."""
+    """Called when a profile is loaded - run migration."""
     migrate_from_json()
-    
+
     # Initialize last check time if not set (so we don't process old reviews)
     if get_last_sync_check_time() == 0:
         import time
         set_last_sync_check_time(int(time.time() * 1000))
-    
-    # Check if any suspended siblings should be unsuspended
-    unsuspended = check_and_unsuspend_siblings()
-    if unsuspended > 0:
-        tooltip(f"Unsuspended {unsuspended} sibling(s) ready for review")
-        log(f"Profile load: unsuspended {unsuspended} siblings")
-    
-    # Enforce separation for review cards (spread due dates if needed)
-    rescheduled = enforce_sibling_separation()
-    if rescheduled > 0:
-        tooltip(f"Rescheduled {rescheduled} sibling(s) to maintain separation")
-        log(f"Profile load: rescheduled {rescheduled} review card siblings")
+
+    # Note: Priority-based sibling separation is handled in on_sync_will_start()
+    # which runs when auto-sync triggers on profile open
 
 # =============================================================================
 # REGISTER HOOKS
@@ -954,6 +1216,7 @@ gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
 gui_hooks.reviewer_did_answer_card.append(on_reviewer_did_answer_card)
 gui_hooks.main_window_did_init.append(setup_menu)
 gui_hooks.profile_did_open.append(on_profile_loaded)
+gui_hooks.sync_will_start.append(on_sync_will_start)
 gui_hooks.sync_did_finish.append(on_sync_did_finish)
 
 log("Sibling Marker addon loaded (v2.0 - tag-based sync)")
