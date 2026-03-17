@@ -9,13 +9,17 @@ Storage: Uses Anki tags with prefix "sibling::" for native sync support.
 """
 
 from aqt import mw, gui_hooks
-from aqt.qt import QAction, QMenu, QInputDialog, QMessageBox
+from aqt.qt import (QAction, QMenu, QInputDialog, QMessageBox,
+                    QDialog, QListWidget, QListWidgetItem, QSplitter,
+                    QScrollArea, QLabel, QPushButton, QHBoxLayout,
+                    QVBoxLayout, QWidget, QFrame, Qt)
 from aqt.browser import Browser
 from aqt.utils import showInfo, tooltip
 from anki.cards import Card
 import os
 import json
 import re
+import html
 import traceback
 from typing import Optional, List, Set
 from datetime import datetime
@@ -545,7 +549,7 @@ def apply_priority_based_separation() -> dict:
         for nid in note_ids:
             try:
                 note = mw.col.get_note(nid)
-                has_suspended_tag = any(t.startswith(SUSPENDED_TAG_PREFIX) for t in note.tags)
+                has_suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}" in note.tags
 
                 for card in note.cards():
                     if card.queue == 0:  # New
@@ -663,21 +667,31 @@ def apply_priority_based_separation() -> dict:
                         log_error(f"Error suspending card {card.id}", e)
 
             elif len(new_cards) == 0 and len(suspended_new_cards) > 0:
-                # No active new cards, but we have suspended ones - unsuspend exactly ONE
+                # No active new cards, but we have suspended ones - unsuspend the next note.
+                # We pick by lowest card ID, then unsuspend ALL cards from that note.
+                # Unsuspending only one card-per-note would leave sibling cards from the same
+                # note in a zombie state: still suspended (queue=-1) but with no tracking tag
+                # after the tag is removed from the note, making them permanently invisible.
                 suspended_sorted = sorted(suspended_new_cards, key=lambda x: x[0].id)
-                card, note = suspended_sorted[0]
+                _, next_note = suspended_sorted[0]
                 try:
-                    card.queue = 0  # Back to new
-                    mw.col.update_card(card)
+                    unsuspended_this_note = 0
+                    for c in next_note.cards():
+                        if c.queue == -1:
+                            c.queue = 0  # Back to new
+                            mw.col.update_card(c)
+                            unsuspended_this_note += 1
+                            log(f"Unsuspended new card {c.id} (next in sequence)")
 
-                    # Remove the sibling-suspended tag
-                    note.tags = [t for t in note.tags if not t.startswith(SUSPENDED_TAG_PREFIX)]
-                    mw.col.update_note(note)
+                    # Safe to remove this group's tag now: all suspended cards from this note are active.
+                    # Only remove the current group's tag so other groups' suspension tracking is preserved.
+                    suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+                    next_note.tags = [t for t in next_note.tags if t != suspended_tag]
+                    mw.col.update_note(next_note)
 
-                    total_unsuspended += 1
-                    log(f"Unsuspended new card {card.id} (next in sequence)")
+                    total_unsuspended += unsuspended_this_note
                 except Exception as e:
-                    log_error(f"Error unsuspending card {card.id}", e)
+                    log_error(f"Error unsuspending cards for note {next_note.id}", e)
 
             # If len(new_cards) == 1 and suspended_new_cards exist, do nothing
             # The one active new card is correct, others wait their turn
@@ -910,31 +924,309 @@ def on_browser_context_menu(browser: Browser, menu: QMenu) -> None:
     except Exception as e:
         log_error("Error creating context menu", e)
 
+class SiblingGroupManagerDialog(QDialog):
+    """Two-pane dialog for viewing and managing sibling groups."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sibling Marker — Groups")
+        self.setMinimumSize(720, 480)
+        self._current_group = None
+        self._groups = {}
+        self._setup_ui()
+        self._load_groups()
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+
+        splitter = QSplitter()
+        try:
+            splitter.setOrientation(Qt.Orientation.Horizontal)
+        except AttributeError:
+            splitter.setOrientation(Qt.Horizontal)
+
+        # --- Left panel ---
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+
+        self._group_count_label = QLabel("0 groups")
+        left_layout.addWidget(self._group_count_label)
+
+        self._list = QListWidget()
+        self._list.currentRowChanged.connect(self._on_group_selected)
+        left_layout.addWidget(self._list)
+
+        splitter.addWidget(left_widget)
+
+        # --- Right panel ---
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+
+        header_row = QHBoxLayout()
+        self._group_name_label = QLabel("")
+        self._group_name_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        header_row.addWidget(self._group_name_label)
+        header_row.addStretch()
+
+        self._rename_btn = QPushButton("Rename")
+        self._rename_btn.setEnabled(False)
+        self._rename_btn.clicked.connect(self._on_rename)
+        header_row.addWidget(self._rename_btn)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setEnabled(False)
+        self._delete_btn.clicked.connect(self._on_delete)
+        header_row.addWidget(self._delete_btn)
+
+        right_layout.addLayout(header_row)
+
+        line = QFrame()
+        try:
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+        except AttributeError:
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+        right_layout.addWidget(line)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        try:
+            self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        except AttributeError:
+            self._scroll_area.setFrameShape(QFrame.NoFrame)
+        right_layout.addWidget(self._scroll_area, 1)
+
+        self._browse_btn = QPushButton("Browse Group in Browser")
+        self._browse_btn.setEnabled(False)
+        self._browse_btn.clicked.connect(self._on_browse)
+        right_layout.addWidget(self._browse_btn)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([220, 500])
+
+        main_layout.addWidget(splitter, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        main_layout.addLayout(footer)
+
+    def _load_groups(self):
+        self._groups = get_all_sibling_groups()
+        prev_group = self._current_group
+        self._list.blockSignals(True)
+        self._list.clear()
+        try:
+            user_role = Qt.ItemDataRole.UserRole
+        except AttributeError:
+            user_role = Qt.UserRole
+        for group_name in sorted(self._groups.keys()):
+            note_ids = self._groups[group_name]
+            item = QListWidgetItem(f"{group_name} ({len(note_ids)} notes)")
+            item.setData(user_role, group_name)
+            self._list.addItem(item)
+        count = len(self._groups)
+        self._group_count_label.setText(f"{count} group{'s' if count != 1 else ''}")
+        self._list.blockSignals(False)
+        # Restore selection
+        restored = False
+        if prev_group:
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if item.data(user_role) == prev_group:
+                    self._list.setCurrentRow(i)
+                    restored = True
+                    break
+        if not restored and self._list.count() > 0:
+            self._list.setCurrentRow(0)
+        elif not restored:
+            self._on_group_selected(-1)
+
+    def _on_group_selected(self, row):
+        try:
+            user_role = Qt.ItemDataRole.UserRole
+        except AttributeError:
+            user_role = Qt.UserRole
+        if row < 0:
+            self._current_group = None
+            self._group_name_label.setText("")
+            self._rename_btn.setEnabled(False)
+            self._delete_btn.setEnabled(False)
+            self._browse_btn.setEnabled(False)
+            self._scroll_area.setWidget(QWidget())
+            return
+        item = self._list.item(row)
+        group_name = item.data(user_role)
+        self._current_group = group_name
+        self._group_name_label.setText(group_name)
+        self._rename_btn.setEnabled(True)
+        self._delete_btn.setEnabled(True)
+        self._browse_btn.setEnabled(True)
+        self._populate_right_panel(group_name)
+
+    def _card_state(self, card, note, group_name):
+        today = mw.col.sched.today
+        q = card.queue
+        if q == 0:
+            return "new · active"
+        elif q == -1:
+            if f"{SUSPENDED_TAG_PREFIX}{group_name}" in note.tags and card.type == 0:
+                return "new · suspended (sibling)"
+            return "suspended (user)"
+        elif q == 1:
+            return "learning"
+        elif q == 3:
+            return "relearning"
+        elif q == 2:
+            if card.due <= today:
+                return "review · due today"
+            days = card.due - today
+            return f"review · in {days} day{'s' if days != 1 else ''}"
+        elif q == -2:
+            return "buried (user)"
+        elif q == -3:
+            return "buried (scheduler)"
+        return f"queue {q}"
+
+    def _populate_right_panel(self, group_name):
+        if mw.col is None:
+            return
+        note_ids = self._groups.get(group_name, [])
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        try:
+            layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        except AttributeError:
+            layout.setAlignment(Qt.AlignTop)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        for nid in sorted(note_ids):
+            try:
+                note = mw.col.get_note(nid)
+                first_field = note.fields[0] if note.fields else "(empty)"
+                first_field = re.sub(r'<[^>]+>', '', first_field).strip()
+                if len(first_field) > 60:
+                    first_field = first_field[:57] + "..."
+                note_label = QLabel(f"<b>{html.escape(first_field)}</b>")
+                note_label.setWordWrap(True)
+                layout.addWidget(note_label)
+                for i, card in enumerate(note.cards(), start=1):
+                    state = self._card_state(card, note, group_name)
+                    card_label = QLabel(f"  Card {i} — {state}")
+                    card_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 12px;")
+                    layout.addWidget(card_label)
+                spacer = QLabel("")
+                spacer.setFixedHeight(6)
+                layout.addWidget(spacer)
+            except Exception as e:
+                log_error(f"Error displaying note {nid} in group manager", e)
+
+        layout.addStretch()
+        self._scroll_area.setWidget(container)
+
+    def _on_rename(self):
+        if not self._current_group or mw.col is None:
+            return
+        old_name = self._current_group
+        new_name_raw, ok = QInputDialog.getText(
+            self, "Rename Group", "New group name:", text=old_name
+        )
+        if not ok or not new_name_raw.strip():
+            return
+        new_name = sanitize_group_name(new_name_raw.strip())
+        if not new_name:
+            tooltip("Invalid group name.")
+            return
+        if new_name == old_name:
+            return
+        if new_name in self._groups:
+            tooltip(f"A group named '{new_name}' already exists.")
+            return
+        old_tag = f"{TAG_PREFIX}{old_name}"
+        new_tag = f"{TAG_PREFIX}{new_name}"
+        old_sus = f"{SUSPENDED_TAG_PREFIX}{old_name}"
+        new_sus = f"{SUSPENDED_TAG_PREFIX}{new_name}"
+        for nid in self._groups.get(old_name, []):
+            try:
+                note = mw.col.get_note(nid)
+                note.tags = [new_tag if t == old_tag else
+                             new_sus if t == old_sus else t
+                             for t in note.tags]
+                mw.col.update_note(note)
+            except Exception as e:
+                log_error(f"Error renaming note {nid}", e)
+        log(f"Renamed sibling group '{old_name}' → '{new_name}'")
+        mw.reset()
+        self._current_group = new_name
+        self._load_groups()
+
+    def _on_delete(self):
+        if not self._current_group or mw.col is None:
+            return
+        group_name = self._current_group
+        try:
+            reply = QMessageBox.question(
+                self, "Delete Group",
+                f"Delete group '{group_name}'?\n\nThis will unsuspend any siblings we suspended.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            yes_val = QMessageBox.StandardButton.Yes
+        except AttributeError:
+            reply = QMessageBox.question(
+                self, "Delete Group",
+                f"Delete group '{group_name}'?\n\nThis will unsuspend any siblings we suspended.",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            yes_val = QMessageBox.Yes
+        if reply != yes_val:
+            return
+        sibling_tag = f"{TAG_PREFIX}{group_name}"
+        suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+        for nid in self._groups.get(group_name, []):
+            try:
+                note = mw.col.get_note(nid)
+                had_suspended = suspended_tag in note.tags
+                note.tags = [t for t in note.tags if t != sibling_tag and t != suspended_tag]
+                if had_suspended:
+                    for card in note.cards():
+                        # Only unsuspend cards we suspended (new cards); leave user-suspended
+                        # review/learning cards alone. card.type == 0 means "new" type.
+                        if card.queue == -1 and card.type == 0:
+                            card.queue = 0
+                            mw.col.update_card(card)
+                mw.col.update_note(note)
+            except Exception as e:
+                log_error(f"Error deleting group tag from note {nid}", e)
+        log(f"Deleted sibling group '{group_name}'")
+        mw.reset()
+        self._current_group = None
+        self._load_groups()
+
+    def _on_browse(self):
+        if not self._current_group:
+            return
+        try:
+            from aqt import dialogs
+            browser = dialogs.open("Browser", mw)
+            browser.search_for(f"tag:{TAG_PREFIX}{self._current_group}")
+        except Exception as e:
+            log_error("Error opening browser from group manager", e)
+
+
 def show_all_groups() -> None:
     """Show all sibling groups in a dialog."""
     if mw.col is None:
         showInfo("Please open a collection first.")
         return
-    
-    groups = get_all_sibling_groups()
-    
-    if not groups:
-        showInfo("No sibling groups defined yet.\n\n"
-                "Use the Browser to select cards, then right-click -> "
-                "Sibling Marker -> Mark as Siblings")
-        return
-    
-    lines = ["Sibling Groups:\n"]
-    total_notes = 0
-    
-    for group_name, note_ids in sorted(groups.items()):
-        lines.append(f"  {TAG_PREFIX}{group_name}: {len(note_ids)} notes")
-        total_notes += len(note_ids)
-    
-    lines.append(f"\nTotal: {len(groups)} groups, {total_notes} notes")
-    lines.append("\nTip: Groups are stored as tags - view them in the tag sidebar!")
-    
-    showInfo("\n".join(lines), title="Sibling Marker - All Groups")
+    dlg = SiblingGroupManagerDialog(mw)
+    dlg.exec()
 
 def setup_menu() -> None:
     """Set up Tools menu entries."""
@@ -949,10 +1241,93 @@ def setup_menu() -> None:
         log_error("Failed to setup menu", e)
 
 def on_profile_loaded() -> None:
-    """Called when a profile is loaded - run migration."""
+    """Called when a profile is loaded - run migration and initial enforcement."""
     migrate_from_json()
-    # Note: Priority-based sibling separation is handled in on_sync_will_start()
-    # which runs when auto-sync triggers on profile open
+    # Run enforcement at profile load so state changes are pending BEFORE auto-sync
+    # computes its change set. This prevents the 'always blue' sync button issue
+    # that occurs when sync_will_start makes changes not included in the current sync.
+    try:
+        result = enforce_sibling_separation()
+        total = result["suspended_new"] + result["buried_learning"] + result["buried_review"] + result["rescheduled_review"] + result["unsuspended"]
+        if total > 0:
+            log(f"Profile load: enforcement affected {total} card(s)")
+    except Exception as e:
+        log_error("Error in profile_loaded enforcement", e)
+
+def on_reviewer_did_show_question(card) -> None:
+    """Inject a sibling indicator below the card during review."""
+    try:
+        if mw.col is None:
+            return
+
+        note = card.note()
+
+        # Find all sibling groups this card's note belongs to
+        sibling_tags = [t for t in note.tags if t.startswith(TAG_PREFIX)]
+        if not sibling_tags:
+            if mw.reviewer:
+                mw.reviewer.web.eval(
+                    "(function(){var e=document.getElementById('sibling-indicator');if(e)e.remove();})();"
+                )
+            return
+
+        parts = []
+        for tag in sibling_tags:
+            group_name = tag[len(TAG_PREFIX):]
+            suspended_tag = f"{SUSPENDED_TAG_PREFIX}{group_name}"
+
+            # Count siblings waiting (suspended by us, not this card's note)
+            try:
+                group_note_ids = mw.col.find_notes(f"tag:{TAG_PREFIX}{group_name}")
+            except Exception:
+                continue
+
+            waiting = 0
+            for nid in group_note_ids:
+                if nid == card.nid:
+                    continue
+                try:
+                    sibling_note = mw.col.get_note(nid)
+                    if suspended_tag not in sibling_note.tags:
+                        continue
+                    for c in sibling_note.cards():
+                        if c.queue == -1:
+                            waiting += 1
+                except Exception:
+                    pass
+
+            if waiting > 0:
+                sibling_word = "sibling" if waiting == 1 else "siblings"
+                parts.append(f"{group_name} · {waiting} {sibling_word} waiting")
+
+        if not parts:
+            if mw.reviewer:
+                mw.reviewer.web.eval(
+                    "(function(){var e=document.getElementById('sibling-indicator');if(e)e.remove();})();"
+                )
+            return
+
+        if not mw.reviewer:
+            return
+
+        text = "  \u2502  ".join(parts)
+        text_escaped = text.replace("\\", "\\\\").replace("'", "\\'")
+        js = f"""
+(function() {{
+    var existing = document.getElementById('sibling-indicator');
+    if (existing) existing.remove();
+    var div = document.createElement('div');
+    div.id = 'sibling-indicator';
+    div.style.cssText = 'position:fixed;bottom:10px;left:0;right:0;text-align:center;font-size:0.72em;color:#999;pointer-events:none;z-index:100;letter-spacing:0.02em;';
+    div.textContent = '\u26d3 {text_escaped}';
+    document.body.appendChild(div);
+}})();
+"""
+        mw.reviewer.web.eval(js)
+
+    except Exception as e:
+        log_error("Error in reviewer_did_show_question hook", e)
+
 
 # =============================================================================
 # REGISTER HOOKS
@@ -963,5 +1338,6 @@ gui_hooks.main_window_did_init.append(setup_menu)
 gui_hooks.profile_did_open.append(on_profile_loaded)
 gui_hooks.sync_will_start.append(on_sync_will_start)
 gui_hooks.sync_did_finish.append(on_sync_did_finish)
+gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 
 log("Sibling Marker addon loaded (v2.0 - tag-based sync)")
