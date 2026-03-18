@@ -2,15 +2,27 @@
 
 _Written entirely by Claude, skim-reviewed by Saul Munn._
 
-Mark any cards as siblings, even across different notes. When you review one card, its custom siblings get buried for the day.
+Mark any cards as siblings, even across different notes. The addon enforces priority-based separation so you never see two siblings on the same day.
 
-## Version 2.0 - Now with Sync!
+## How It Works
 
-Sibling groups are now stored as Anki tags, which means they **sync automatically** across all your devices via AnkiWeb.
+Sibling groups are stored as Anki tags with a `sibling::` prefix, so they **sync automatically** via AnkiWeb. The addon separates siblings using a three-tier priority system that runs at sync time (before and after) and on profile load:
+
+**Priority: Learning > Review > New**
+
+| Situation | New siblings | Review siblings | Learning siblings |
+|---|---|---|---|
+| Learning card active | Suspended | Buried for today | Only 1 kept; extras buried |
+| Review card due (no learning) | Suspended | Only 1 kept; extras rescheduled to tomorrow | — |
+| Only new cards | Only 1 active; extras suspended | — | — |
+
+When you finish all active cards in a group, the addon automatically **unsuspends the next sibling** in the queue. This means siblings are introduced one at a time as you work through them.
+
+Cards suspended by the addon are tracked with a `sibling-suspended::` tag so they can be distinguished from cards you suspended manually.
 
 ## Installation
 
-1. Download `sibling_marker_v2.ankiaddon`
+1. Download `sibling_marker_v4.ankiaddon`
 2. In Anki: Tools → Add-ons → Install from file...
 3. Select the downloaded file
 4. Restart Anki
@@ -23,7 +35,7 @@ Sibling groups are now stored as Anki tags, which means they **sync automaticall
 2. Select 2 or more cards from different notes
 3. Right-click → **Sibling Marker** → **Mark as Siblings**
 
-The cards' notes will be tagged with a `sibling::` tag (e.g., `sibling::a1b2c3d4`).
+The cards' notes will be tagged with a `sibling::` tag (e.g., `sibling::a1b2c3d4`). Separation is applied immediately: new cards beyond the first are suspended, and review cards due on the same day are spread across consecutive days.
 
 ### Named Groups
 
@@ -34,28 +46,44 @@ You can give your sibling groups meaningful names:
 
 This creates tags like `sibling::anatomy_bones` or `sibling::anatomy::bones`.
 
-### Viewing Groups
+### Adding to an Existing Group
 
-- **Tools → Sibling Marker: View Groups** - See all sibling groups
-- **Tag sidebar** - Your sibling groups appear under the `sibling` tag hierarchy
+1. Select cards in the Browser
+2. Right-click → **Sibling Marker** → **Add to Existing Group...**
+3. Pick from a list of your current groups
+
+### Group Manager
+
+**Tools → Sibling Marker: View Groups** opens a two-pane dialog:
+
+- **Left pane**: All sibling groups with note counts
+- **Right pane**: For the selected group, each note's first field and detailed card states (e.g., "new · active", "new · suspended (sibling)", "review · due today", "review · in 3 days")
+
+From here you can **rename**, **delete**, or **browse** a group in the card browser. Deleting a group unsuspends any cards the addon had suspended.
 
 ### Removing Cards from Groups
 
 1. Select cards in the Browser
 2. Right-click → **Sibling Marker** → **Remove from Sibling Group**
 
-Or simply remove the `sibling::*` tag from the note manually.
+This removes both the `sibling::` and `sibling-suspended::` tags and unsuspends any cards the addon had suspended.
 
-## How It Works
+### Reviewer Indicator
 
-When you answer a card during review:
-1. The addon checks if the card's note has any `sibling::*` tags
-2. It finds all other notes with the same tag(s)
-3. It buries all cards from those sibling notes that are due today
+During review, a small indicator appears at the bottom of the screen showing how many siblings are waiting in each group (e.g., "anatomy · 2 siblings waiting").
+
+## Sync and Mobile
+
+Separation runs **before and after every sync**:
+
+- **Before sync**: Ensures local state is correct before uploading
+- **After sync**: Handles changes that arrived from mobile (e.g., a card reviewed on AnkiMobile triggers the next sibling to unsuspend)
+
+Since suspension and rescheduling both sync via AnkiWeb, siblings stay separated even when reviewing on mobile. Burying does *not* sync, which is why the addon prefers suspension and rescheduling for durable separation.
 
 ## Tag Hierarchy
 
-Anki supports hierarchical tags using `::` as a separator. You can organize sibling groups like:
+Anki supports hierarchical tags using `::` as a separator:
 
 ```
 sibling::anatomy::bones
@@ -65,14 +93,6 @@ sibling::languages::french
 ```
 
 These display as a collapsible tree in Anki's tag sidebar.
-
-## Sync
-
-Since v2.0, sibling relationships are stored as tags, which sync via AnkiWeb like any other tag. This means:
-
-- Your sibling groups sync to all your devices automatically
-- You can view and edit sibling groups on AnkiMobile/AnkiDroid by editing tags
-- No separate data files to manage
 
 ## Migration from v1.x
 
@@ -85,14 +105,20 @@ Your old data file (`user_files/sibling_groups.json`) will be renamed to `.migra
 - **Per-note, not per-card**: Tags are applied to notes, so all cards from a note share the same sibling relationships
 - **Native siblings still work**: Anki's built-in sibling burying for cards from the same note works as usual
 - **Safe**: The addon only uses official Anki APIs and never modifies your collection directly
+- **Qt 5 and Qt 6**: The addon handles both Qt versions for cross-platform compatibility
 
 ## Troubleshooting
 
-**Cards aren't being buried:**
+**Cards aren't being separated:**
 - Make sure both notes have the same `sibling::*` tag
-- Check that the sibling cards are due today (or are new/learning)
-- Cards that are already buried or suspended won't be buried again
+- Separation runs at sync time and profile load, not during review — try syncing
+- Check `sibling_marker.log` in the addon folder for details
+
+**A card is stuck suspended:**
+- Open the Group Manager (Tools → Sibling Marker: View Groups) to see card states
+- If a card shows "suspended (user)", the addon won't touch it — you suspended it manually
+- If it shows "new · suspended (sibling)", it's waiting its turn in the queue
 
 **Migration didn't work:**
 - Check if `user_files/sibling_groups.json.migrated` exists (means migration ran)
-- If the original `.json` file still exists, migration may have failed - check Anki's debug console for errors
+- If the original `.json` file still exists, migration may have failed — check Anki's debug console for errors
