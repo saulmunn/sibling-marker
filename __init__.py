@@ -832,9 +832,9 @@ def migrate_from_json() -> bool:
 # HOOKS
 # =============================================================================
 
-def on_sync_will_start() -> None:
-    """Called before sync starts - enforce sibling separation."""
-    log("Sync starting - running priority separation")
+def on_sync_did_finish() -> None:
+    """Called after sync completes - enforce separation to handle all changes."""
+    log("Sync finished - running priority separation")
     try:
         result = enforce_sibling_separation()
         total = result["suspended_new"] + result["buried_learning"] + result["buried_review"] + result["rescheduled_review"] + result["unsuspended"]
@@ -853,32 +853,7 @@ def on_sync_will_start() -> None:
                 parts.append(f"{result['unsuspended']} unsuspended")
             tooltip(f"Sibling Marker: {', '.join(parts)}")
 
-        log(f"Pre-sync: priority separation affected {total} card(s)")
-    except Exception as e:
-        log_error("Error in sync_will_start hook", e)
-
-def on_sync_did_finish() -> None:
-    """Called after sync completes - re-run separation to handle mobile reviews."""
-    log("Sync finished - running priority separation for incoming changes")
-    try:
-        result = enforce_sibling_separation()
-        total = result["suspended_new"] + result["buried_learning"] + result["buried_review"] + result["rescheduled_review"] + result["unsuspended"]
-
-        if total > 0:
-            parts = []
-            if result["suspended_new"] > 0:
-                parts.append(f"{result['suspended_new']} new suspended")
-            if result["buried_learning"] > 0:
-                parts.append(f"{result['buried_learning']} learning buried")
-            if result["buried_review"] > 0:
-                parts.append(f"{result['buried_review']} review buried")
-            if result["rescheduled_review"] > 0:
-                parts.append(f"{result['rescheduled_review']} review rescheduled")
-            if result["unsuspended"] > 0:
-                parts.append(f"{result['unsuspended']} unsuspended")
-            tooltip(f"Sibling Marker (post-sync): {', '.join(parts)}")
-
-        log(f"Post-sync: priority separation affected {total} card(s)")
+        log(f"Post-sync separation affected {total} card(s)")
     except Exception as e:
         log_error("Error in sync_did_finish hook", e)
 
@@ -1336,7 +1311,6 @@ def on_reviewer_did_show_question(card) -> None:
 gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
 gui_hooks.main_window_did_init.append(setup_menu)
 gui_hooks.profile_did_open.append(on_profile_loaded)
-gui_hooks.sync_will_start.append(on_sync_will_start)
 gui_hooks.sync_did_finish.append(on_sync_did_finish)
 gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 
